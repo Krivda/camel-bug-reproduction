@@ -5,4 +5,15 @@
     <root level="info">
         <appender-ref ref="CONSOLE"/>
     </root>
+
+    <logger name="org.apache.kafka.clients.admin" level="WARN"/>
+    <logger name="org.apache.kafka.clients.producer" level="WARN"/>
+    <logger name="org.apache.zookeeper" level="WARN"/>
+    <logger name="kafka" level="WARN"/>
+    <logger name="org.apache.kafka.common.metrics.Metrics" level="WARN"/>
+    <logger name="org.apache.kafka.common.utils.AppInfoParser" level="WARN"/>
+
+
+    <logger name="org.apache.camel.component.kafka.consumer" level="DEBUG"/>
+
 </configuration>

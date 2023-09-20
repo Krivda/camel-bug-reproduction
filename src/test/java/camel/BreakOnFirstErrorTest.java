@@ -8,20 +8,19 @@ import org.apache.camel.builder.RouteBuilder;
 import org.apache.camel.builder.endpoint.dsl.DirectEndpointBuilderFactory.DirectEndpointBuilder;
 import org.apache.camel.builder.endpoint.dsl.KafkaEndpointBuilderFactory.KafkaEndpointBuilder;
 import org.apache.camel.component.kafka.KafkaConstants;
+import org.apache.camel.component.kafka.consumer.DefaultKafkaManualCommitFactory;
 import org.apache.camel.test.spring.junit5.CamelSpringBootTest;
 import org.apache.camel.test.spring.junit5.UseAdviceWith;
-import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.kafka.test.context.EmbeddedKafka;
-import org.springframework.kafka.test.utils.KafkaTestUtils;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 
 import static org.apache.camel.builder.endpoint.StaticEndpointBuilders.direct;
 import static org.apache.camel.builder.endpoint.StaticEndpointBuilders.kafka;
@@ -36,9 +35,11 @@ import static org.awaitility.Awaitility.await;
 public class BreakOnFirstErrorTest {
 
 
+    @SuppressWarnings("SpringJavaInjectionPointsAutowiringInspection") // it's just a test
     @Autowired
     protected CamelContext camelContext;
 
+    @SuppressWarnings("SpringJavaInjectionPointsAutowiringInspection") // it's just a test
     @Autowired
     protected ProducerTemplate kafkaProducer;
 
@@ -58,7 +59,7 @@ public class BreakOnFirstErrorTest {
     }
 
     @Test
-    public void shouldOnlyReconsumeFailedMessageOnError() {
+    public void shouldNotGetOverFirstError() throws Exception {
         // partitions are consumed backwards :)
         final List<String> producedRecordsPartition0 = List.of("5", "6", "7", "8", "9", "10", "11"); // <- Error is thrown once on record "5"
         final List<String> producedRecordsPartition1 = List.of("1", "2", "3", "4");
@@ -68,12 +69,15 @@ public class BreakOnFirstErrorTest {
 
         produceRecords(producedRecordsPartition0, producedRecordsPartition1);
 
-        await().untilAsserted(() ->
+        await()
+                .timeout(30, TimeUnit.SECONDS)
+                .pollDelay(20, TimeUnit.SECONDS) // give A LOT of time to finish consumption and avoid race
+                .untilAsserted(() ->
                 // Assertion fails as all records on topic are reconsumed on error.
                 assertThat(consumedRecords).isEqualTo(expectedConsumedRecords));
         //actual results:
         //expected: ["1", "2", "3", "4"]
-        //but was: ["1", "2", "3", "4", "9", "10", "11", "1", "2", "3", "4"]
+        //but was: ["1", "2", "3", "4", "9", "10", "11"]
 
         // Detailed description here. Warning: a huge wall of text
         /*
@@ -93,13 +97,16 @@ public class BreakOnFirstErrorTest {
 
          Bug1. lastResult variable is not getting initialized before the next poll, and it still contains an old offset
           from the previous polling
-         Bug2. lastResult variable is not getting initialized before proceeding to the next partition, and it still
-          contains an old offset from the previous partition
+         *Possible* Bug2. lastResult variable is not getting initialized before proceeding to the next partition, and it still
+         contains an old offset from the previous partition
 
          let's dive into:
          this mock example (again, many thanks to Karen Lease) setups quite a specific situation and a specific poll.
          Due to .maxPollRecords(8) - we will happen to get exactly 8 records in a single poll.
           4 of them will be from part_0 and 4 from part_1.
+         For simplicity - autocommits are disabled and DefaultKafkaManualCommitFactory is used to perform commits after
+         each partition in the poll is processed.
+
          The example is set up to produce an exception exactly if message body == "5",
          which is (and that's crucial) the very first record in part_0.
          route will start consuming all records from part_1 (partitions are consumed backwards by the iterator).
@@ -123,7 +130,14 @@ public class BreakOnFirstErrorTest {
         //
         //               // stripped, as consumerListener == null in the case
         //           }
+        //
         //           // stripped, as breakOnFirstError is enabled
+        //
+        //          if (!lastResult.isBreakOnErrorHit()) {
+        //              LOG.debug("Committing offset on successful execution");
+        //              // all records processed from partition so commit them
+        // [3]          commitManager.commit(partition);
+        //          }
         //       }
 
          Here come the two loops, "outer", the partitionIterator loop and "inner", the recordIterator loop.
@@ -133,6 +147,7 @@ public class BreakOnFirstErrorTest {
          (as  lastResult is passed as parameter from outer scope of KafkaFetchRecords.startPolling(), where it's not cleared
          before new poll) and still holds the __offset__ value from prev iteration (Bug2).
          Everything goes smooth if point [2] executes without exception and lastResult is getting updated set successfully.
+         [3] ensures offset is either committed (as is in the example) or scheduled to commit (for other commit behaviours)
          Everything becomes messy if there's an exception.
          Note, that "partition" variable is reassigned at the outer loop start is being passed to processRecord(...) method.
 
@@ -144,7 +159,7 @@ public class BreakOnFirstErrorTest {
         //         exchange.setException(e);
         //     }
         //     if (exchange.getException() != null) {
-        // [3]    boolean breakOnErrorExit = processException(exchange, partition, lastResult.getPartitionLastOffset(),
+        // [4]    boolean breakOnErrorExit = processException(exchange, partition, lastResult.getPartitionLastOffset(),
         //                 exceptionHandler);
         //         return new ProcessingResult(breakOnErrorExit, lastResult.getPartitionLastOffset(), true);
         //     } else {
@@ -152,11 +167,12 @@ public class BreakOnFirstErrorTest {
         //     }
 
           Note: lastResult variable was not changed at this point.
-          Note point [3]: here processException()'s parameter "partitionLastOffset" is calculated as lastResult.getPartitionLastOffset()
+          Note point [4]: here processException()'s parameter "partitionLastOffset" is calculated as lastResult.getPartitionLastOffset()
 
          As we do know now, lastResult here has some "dirty" value got from some previous iteration,
-         which has nothing to do with the current partition. But in processException() code it's presumed to be a valid offset
-         for the __current__ partition, and it gets committed to it at point [4] of KafkaRecordProcessor.processException()
+         which has nothing to do with the current partition. But in processException() code it is presumed to be a valid offset
+         for the __current__ partition (point [1] earlier), and it gets committed to it at point [5]
+         of KafkaRecordProcessor.processException()
 
         //      if (configuration.isBreakOnFirstError()) {
         //          // we are failing and we should break out
@@ -168,7 +184,7 @@ public class BreakOnFirstErrorTest {
         //          // force commit, so we resume on next poll where we failed except when the failure happened
         //          // at the first message in a poll
         //          if (partitionLastOffset != AbstractCommitManager.START_OFFSET) {
-        // [4]           commitManager.forceCommit(partition, partitionLastOffset);
+        // [5]           commitManager.forceCommit(partition, partitionLastOffset);
         //          }
         //
         //          // continue to next partition
@@ -178,8 +194,11 @@ public class BreakOnFirstErrorTest {
          Note: here we have committed a completely "random" (unrelated to the partition) offset to the current partition
          causing component to ether loosing or re-consuming records.
          In this setup, we commit invalid offset=3 to part_0, and thus have lost records "5", "6", "7", "8"
-         it doesn't stop here, as the valid commit to part_1 also was not made, which causes component to re-consume
-         records "1", "2", "3", "4"
+
+         it *MAY* doesn't stop here, as the valid commit to part_1 also was not made (depending upon commit strategy and
+         race condition issues between polling and async commits, as commit to part_1 may not be physically made, only just scheduled),
+         which *MAY* cause component to re-consume records "1", "2", "3", "4" (I haven't reproduced it, but it seems
+         very likely to be the case)
 
          Actually, I don't have any quick fix idea for these bugs, as the fix surely will be very intrusive. Somehow,
          lastOffset should be cleared before the start of polling loop (that's easy) and at the start of the partitions
@@ -190,34 +209,31 @@ public class BreakOnFirstErrorTest {
 
     }
 
-    private void produceRecords(final List<String> producedRecordsPartition0, List<String> producedRecordsPartition1) {
-        // Producing in two batches to ensure application has a committed offset
-        //final int size = producedRecordsPartition1.size();
-        //final int middleIndex = (size + 1) / 2;
-        //final List<String> firstHalf = new ArrayList<>(producedRecordsPartition1.subList(0, middleIndex));
-        //final List<String> secondHalf = new ArrayList<>(producedRecordsPartition1.subList(middleIndex, size));
+    private void produceRecords(final List<String> producedRecordsPartition0, List<String> producedRecordsPartition1) throws Exception {
 
         producedRecordsPartition0.forEach(v -> kafkaProducer.sendBodyAndHeader(v, KafkaConstants.PARTITION_KEY, 0));
         producedRecordsPartition1.forEach(v -> kafkaProducer.sendBodyAndHeader(v, KafkaConstants.PARTITION_KEY, 1));
-
-
-//        await().until(() -> getCurrentOffset() > 0);
-//        System.out.println("Offset committed: " + getCurrentOffset());
-//        secondHalf.forEach(kafkaProducer::sendBody);
-    }
-
-    private Long getCurrentOffset() {
-        try {
-            return Optional.ofNullable(KafkaTestUtils.getCurrentOffset(kafkaBrokerAddress, kafkaGroupId, kafkaTopicName, 0)).map(OffsetAndMetadata::offset).orElse(0L);
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
+        camelContext.getRouteController().startRoute("kafkaConsumer");
     }
 
     private void createConsumerRoute(RouteBuilder builder) {
-        builder.from(kafkaTestTopic().groupId(kafkaGroupId).autoOffsetReset("earliest").breakOnFirstError(true)
+        builder
+             .from(kafkaTestTopic()
+                .groupId(kafkaGroupId)
+                .autoOffsetReset("earliest")
+                .breakOnFirstError(true)
+                .autoCommitEnable(false)
+                .allowManualCommit(true)
                 //  get 8 recs total: 4 from part_0 and 4 from part_1 in first poll. recs "9" and "10" won't be in first poll
-                .maxPollRecords(8)).log(">> Partition:${header.kafka.PARTITION} offset:${header.kafka.OFFSET} Body:${body}").process(this::ifIsFifthRecordThrowException).process().body(String.class, body -> consumedRecords.add(body)).log("consumed<< ");
+                .maxPollRecords(8)
+                .commitTimeoutMs(1000000L) // just to make debugging easy
+             )
+            .routeId("kafkaConsumer")
+            .autoStartup(false)
+            .log(">> Partition:${header.kafka.PARTITION} offset:${header.kafka.OFFSET} Body:${body}")
+            .process(this::ifIsFifthRecordThrowException)
+            .process().body(String.class, body -> consumedRecords.add(body))
+            .log("consumed<< ");
     }
 
     private void ifIsFifthRecordThrowException(Exchange e) {
@@ -230,10 +246,19 @@ public class BreakOnFirstErrorTest {
         final DirectEndpointBuilder mockKafkaProducer = direct("mockKafkaProducer");
         kafkaProducer.setDefaultEndpoint(mockKafkaProducer.resolve(camelContext));
 
-        builder.from(mockKafkaProducer).to(kafkaTestTopic());
+        builder
+            .from(mockKafkaProducer)
+            .to(kafkaTestTopic())
+            .log("Sent: ${body}");
     }
 
     private KafkaEndpointBuilder kafkaTestTopic() {
-        return kafka(kafkaTopicName).brokers(kafkaBrokerAddress);
+        var basic = kafka(kafkaTopicName)
+                .brokers(kafkaBrokerAddress);
+
+        basic
+            .advanced()
+                .kafkaManualCommitFactory(new DefaultKafkaManualCommitFactory()); // Ensure commits after each partition is processed
+        return basic;
     }
 }
