@@ -1,6 +1,6 @@
 # camel-kafka-breaks-offsets-on-exception-in-first-record-with-breakOnFirstError-set
 
-Project with test demonstrating issue 
+Project with test demonstrating issue https://issues.apache.org/jira/browse/CAMEL-19894
 
 ## Versions
 * java 17
